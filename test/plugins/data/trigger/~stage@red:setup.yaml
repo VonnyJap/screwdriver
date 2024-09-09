@@ -8,6 +8,10 @@ stages:
     requires: [ ~a ]
     description: First stage
     jobs: [ b ]
+    setup:
+      image: node:20
+      steps:
+        -  init: echo 'red setup'
 
 jobs:
   hub:

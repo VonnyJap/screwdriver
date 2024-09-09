@@ -83,6 +83,7 @@ describe('pipeline plugin test', () => {
     let bannerMock;
     let screwdriverAdminDetailsMock;
     let scmMock;
+    let templateFactoryMock;
     let pipelineTemplateFactoryMock;
     let pipelineTemplateVersionFactoryMock;
     let pipelineTemplateTagFactoryMock;
@@ -160,6 +161,9 @@ describe('pipeline plugin test', () => {
             create: sinon.stub(),
             remove: sinon.stub()
         };
+        templateFactoryMock = {
+            getTemplate: sinon.stub().resolves({ templateId: 1234 })
+        };
         pipelineTemplateVersionFactoryMock = {
             create: sinon.stub(),
             list: sinon.stub(),
@@ -192,6 +196,7 @@ describe('pipeline plugin test', () => {
             tokenFactory: tokenFactoryMock,
             bannerFactory: bannerFactoryMock,
             secretFactory: secretFactoryMock,
+            templateFactory: templateFactoryMock,
             pipelineTemplateFactory: pipelineTemplateFactoryMock,
             pipelineTemplateVersionFactory: pipelineTemplateVersionFactoryMock,
             pipelineTemplateTagFactory: pipelineTemplateTagFactoryMock,
@@ -257,7 +262,6 @@ describe('pipeline plugin test', () => {
                     strategy: ['token']
                 }
             };
-
             expected = {
                 namespace: 'template_namespace',
                 name: 'template_name',
@@ -265,9 +269,22 @@ describe('pipeline plugin test', () => {
                 description: 'template description',
                 maintainer: 'name@domain.org',
                 config: {
-                    jobs: { main: { steps: [{ init: 'npm install' }, { test: 'npm test' }] } },
-                    shared: {},
+                    jobs: {
+                        main: {
+                            steps: [{ init: 'npm install' }, { test: 'npm test' }],
+                            annotations: {},
+                            environment: {},
+                            settings: {},
+                            image: 'node:20',
+                            secrets: [],
+                            sourcePaths: []
+                        }
+                    },
                     parameters: {}
+                },
+                workflowGraph: {
+                    nodes: [{ name: '~pr' }, { name: '~commit' }, { name: 'main' }],
+                    edges: []
                 },
                 pipelineId: 123
             };
@@ -389,9 +406,32 @@ describe('pipeline plugin test', () => {
                             description: 'template description',
                             maintainer: 'name@domain.org',
                             config: {
-                                jobs: { main: { steps: [{ init: 'npm install' }, { test: 'npm test' }] } },
-                                shared: {},
+                                jobs: {
+                                    main: {
+                                        steps: [{ init: 'npm install' }, { test: 'npm test' }],
+                                        annotations: {},
+                                        environment: {},
+                                        settings: {},
+                                        image: 'node:20',
+                                        secrets: [],
+                                        sourcePaths: []
+                                    }
+                                },
                                 parameters: {}
+                            },
+                            workflowGraph: {
+                                edges: [],
+                                nodes: [
+                                    {
+                                        name: '~pr'
+                                    },
+                                    {
+                                        name: '~commit'
+                                    },
+                                    {
+                                        name: 'main'
+                                    }
+                                ]
                             }
                         }
                     });

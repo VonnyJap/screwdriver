@@ -1,5 +1,7 @@
 @parallel
 @pipelinetemplate
+@x1
+
 Feature: Pipeline Templates
 
     Pipeline template is simply an existing configuration for a pipeline that can be reused.
@@ -21,10 +23,9 @@ Feature: Pipeline Templates
         template: node/test@1
 
     The user's config would be translated to:
-        shared:
-            image: node:18
         jobs:
             main:
+                image: node:18
                 steps:
                     - init: npm install
                     - test: npm test

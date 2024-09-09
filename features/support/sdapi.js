@@ -146,8 +146,18 @@ function findEventBuilds(config) {
  * @param  {String}  [config.eventId]           Event ID
  * @return {Promise}                            A build that fulfills the given criteria
  */
-function searchForBuild(config) {
-    const { instance, pipelineId, pullRequestNumber, desiredSha, desiredStatus, jwt, parentBuildId, eventId } = config;
+function searchForBuild(config, retry = 1000, retryCount = 0) {
+    const {
+        instance,
+        pipelineId,
+        pullRequestNumber,
+        desiredSha,
+        subscribedConfigSha,
+        desiredStatus,
+        jwt,
+        parentBuildId,
+        eventId
+    } = config;
     const jobName = config.jobName || 'main';
 
     return findBuilds({
@@ -161,6 +171,10 @@ function searchForBuild(config) {
 
         if (desiredSha) {
             result = result.filter(item => item.sha === desiredSha);
+        }
+
+        if (subscribedConfigSha) {
+            result = result.filter(item => item.subscribedConfigSha === subscribedConfigSha);
         }
 
         if (desiredStatus) {
@@ -179,7 +193,11 @@ function searchForBuild(config) {
             return result[0];
         }
 
-        return promiseToWait(WAIT_TIME).then(() => searchForBuild(config));
+        if (retryCount >= retry) {
+            return Promise.reject(new Error('Retry count exceeded'));
+        }
+
+        return promiseToWait(WAIT_TIME).then(() => searchForBuild(config, retry, retryCount + 1));
     });
 }
 
@@ -237,36 +255,39 @@ function searchForBuilds(config) {
 }
 
 /**
- * Waits for a specific build to reach a desired status. If a build is found to not be
+ * Waits for a specific stageBuild to reach a desired status. If a stageBuild is found to not be
  * in the desired state, it waits an arbitrarily short amount of time before querying
- * the build status again.
+ * the stageBuild status again.
  *
- * @method waitForBuildStatus
+ * @method waitForStageBuildStatus
  * @param  {Object}  config               Configuration object
+ * @param  {Number}  config.eventId       Event ID
  * @param  {String}  config.instance      Screwdriver instance to test against
- * @param  {String}  config.buildId       Build ID to find the build in
- * @param  {Array}   config.desiredStatus Array of status strings. The status of the build to wait for
- * @return {Object}                       Build data
+ * @param  {Number}  config.stageId       Stage ID
+ * @param  {String}  config.jwt           JWT
+ * @param  {String}  config.desiredStatus Desired status
+ * @return {Object}                       StageBuild data
  */
-function waitForBuildStatus(config) {
-    const { buildId } = config;
-    const { desiredStatus } = config;
-    const { instance } = config;
+function waitForStageBuildStatus(config) {
+    const { eventId, desiredStatus, instance, jwt, stageId } = config;
 
     return request({
         method: 'GET',
-        url: `${instance}/v4/builds/${buildId}`,
+        url: `${instance}/v4/events/${eventId}/stageBuilds`,
         context: {
-            token: config.jwt
+            token: jwt
         }
     }).then(response => {
-        const buildData = response.body;
+        const stageBuildData = response.body;
 
-        if (desiredStatus.includes(buildData.status)) {
-            return buildData;
+        // Find stageBuild for stage
+        const stageBuild = stageBuildData.find(sb => sb.stageId === stageId);
+
+        if (stageBuild && stageBuild.status === desiredStatus) {
+            return stageBuild;
         }
 
-        return promiseToWait(WAIT_TIME).then(() => waitForBuildStatus(config));
+        return promiseToWait(WAIT_TIME).then(() => waitForStageBuildStatus(config));
     });
 }
 
@@ -384,6 +405,6 @@ module.exports = {
     findEventBuilds,
     searchForBuild,
     searchForBuilds,
-    waitForBuildStatus,
+    waitForStageBuildStatus,
     promiseToWait
 };

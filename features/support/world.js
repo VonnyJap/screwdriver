@@ -7,20 +7,7 @@ const { setWorldConstructor } = require('@cucumber/cucumber');
 const request = require('screwdriver-request');
 const { ID } = require('./constants');
 
-/**
- * Retry until the build has finished
- * @method buildRetryStrategy
- * @param  {Object}     response
- * @param  {Function}   retryWithMergedOptions
- * @return {Object}     Build response
- */
-function buildRetryStrategy(response) {
-    if (response.body.status === 'QUEUED' || response.body.status === 'RUNNING') {
-        throw new Error('Retry limit reached');
-    }
-
-    return response;
-}
+const RETRY_COUNT_LIMIT = 30;
 
 /**
  * Promise to wait a certain number of seconds
@@ -32,6 +19,39 @@ function promiseToWait(timeToWait) {
     return new Promise(resolve => {
         setTimeout(() => resolve(), timeToWait * 1000);
     });
+}
+
+/**
+ * Ensure a stage exists with its jobs
+ * @param  {Object}    config
+ * @param  {Object}    config.table                Table with stage and jobs data
+ * @return {Promise}
+ */
+async function ensureStageExists({ table }) {
+    if (table && this.pipelineId) {
+        const expectedStages = table.hashes();
+
+        for (let i = 0; i < expectedStages.length; i += 1) {
+            const stage = await this.getStage(this.pipelineId, expectedStages[i].stage);
+            const expectedJobNames =
+                expectedStages[i].jobs.trim() !== '' ? expectedStages[i].jobs.split(/\s*,\s*/) : expectedStages[i].jobs;
+            const expectedJobIds = [];
+
+            this.stageName = stage.body[0].name;
+            this.stageId = stage.body[0].id;
+
+            // Map expected stage job names to jobIds
+            expectedJobNames.forEach(jobName => {
+                const job = this.jobs.find(j => j.name === jobName);
+
+                expectedJobIds.push(job.id);
+            });
+            // Check if each jobId exists in stage jobIds
+            const stageExists = expectedJobIds.every(id => stage.body[0].jobIds.includes(id));
+
+            Assert.ok(stageExists, 'Given jobs do not exist in stage');
+        }
+    }
 }
 
 /**
@@ -64,7 +84,7 @@ function ensurePipelineExists(config) {
 
                 this.pipelineId = response.body.id;
 
-                return this.getPipeline(this.pipelineId);
+                return this.getPipelineJobs(this.pipelineId);
             })
             .catch(err => {
                 const [, str] = err.message.split(': ');
@@ -81,12 +101,12 @@ function ensurePipelineExists(config) {
 
                             this.pipelineId = resCre.body.id;
 
-                            return this.getPipeline(this.pipelineId);
+                            return this.getPipelineJobs(this.pipelineId);
                         });
                     });
                 }
 
-                return this.getPipeline(this.pipelineId);
+                return this.getPipelineJobs(this.pipelineId);
             })
             /* eslint-disable complexity */
             .then(response => {
@@ -161,6 +181,9 @@ function ensurePipelineExists(config) {
                         case 'parallel_B2':
                             this.parallel_B2JobId = job.id;
                             break;
+                        case 'hub':
+                            this.hubJobId = job.id;
+                            break;
                         default:
                             // main job
                             this.jobId = job.id;
@@ -198,22 +221,68 @@ function CustomWorld({ attach, parameters }) {
             method: 'GET',
             url: `${this.instance}/${this.namespace}/auth/token?api_token=${apiToken}`
         });
-    this.waitForBuild = buildID =>
-        request({
-            url: `${this.instance}/${this.namespace}/builds/${buildID}`,
+    this.waitForBuild = async buildId => {
+        let lastStatus = '';
+
+        for (let i = 0; i < RETRY_COUNT_LIMIT; i += 1) {
+            await promiseToWait(i + 10);
+
+            const response = await request({
+                url: `${this.instance}/${this.namespace}/builds/${buildId}`,
+                method: 'GET',
+                retry: {
+                    statusCodes: [200],
+                    limit: 30,
+                    calculateDelay: ({ computedValue }) => (computedValue ? 15000 : 0)
+                },
+                context: {
+                    token: this.jwt
+                }
+            });
+
+            lastStatus = response.body.status;
+
+            if (!['CREATED', 'BLOCKED', 'QUEUED', 'RUNNING'].includes(lastStatus)) {
+                return response;
+            }
+        }
+
+        throw new Error(`Expect the build "${buildId}" to be complete. Actual "${lastStatus}".`);
+    };
+    this.stopBuild = async buildId => {
+        const response = await request({
+            url: `${this.instance}/${this.namespace}/builds/${buildId}`,
             method: 'GET',
             retry: {
                 statusCodes: [200],
                 limit: 25,
                 calculateDelay: ({ computedValue }) => (computedValue ? 15000 : 0)
             },
-            hooks: {
-                afterResponse: [buildRetryStrategy]
-            },
             context: {
                 token: this.jwt
             }
         });
+
+        if (!['CREATED', 'BLOCKED', 'QUEUED', 'RUNNING'].includes(response.body.status)) {
+            return response;
+        }
+
+        return request({
+            url: `${this.instance}/${this.namespace}/builds/${buildId}`,
+            method: 'PUT',
+            retry: {
+                statusCodes: [200],
+                limit: 30,
+                calculateDelay: ({ computedValue }) => (computedValue ? 15000 : 0)
+            },
+            context: {
+                token: this.jwt
+            },
+            json: {
+                status: 'ABORTED'
+            }
+        });
+    };
     this.loginWithToken = apiToken =>
         request({
             url: `${this.instance}/${this.namespace}/auth/logout`,
@@ -231,9 +300,25 @@ function CustomWorld({ attach, parameters }) {
                     this.loginResponse = err;
                 })
         );
-    this.getPipeline = pipelineId =>
+    this.getPipelineJobs = pipelineId =>
         request({
             url: `${this.instance}/${this.namespace}/pipelines/${pipelineId}/jobs`,
+            method: 'GET',
+            context: {
+                token: this.jwt
+            }
+        });
+    this.getStage = (pipelineId, stageName) =>
+        request({
+            url: `${this.instance}/${this.namespace}/pipelines/${pipelineId}/stages?name=${stageName}`,
+            method: 'GET',
+            context: {
+                token: this.jwt
+            }
+        });
+    this.getPipeline = pipelineId =>
+        request({
+            url: `${this.instance}/${this.namespace}/pipelines/${pipelineId}`,
             method: 'GET',
             context: {
                 token: this.jwt
@@ -266,6 +351,7 @@ function CustomWorld({ attach, parameters }) {
             }
         });
     this.ensurePipelineExists = ensurePipelineExists;
+    this.ensureStageExists = ensureStageExists;
 }
 
 setWorldConstructor(CustomWorld);

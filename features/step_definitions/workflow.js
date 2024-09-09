@@ -61,7 +61,7 @@ Given(
 
                     [this.pipelineId] = str.match(ID);
                 })
-                .then(() => this.getPipeline(this.pipelineId))
+                .then(() => this.getPipelineJobs(this.pipelineId))
                 .then(response => {
                     const expectedJobs = table.hashes();
 
@@ -160,16 +160,24 @@ Then(
         timeout: TIMEOUT
     },
     function step(jobName) {
-        return sdapi
-            .searchForBuild({
-                instance: this.instance,
-                pipelineId: this.pipelineId,
-                desiredSha: this.sha,
-                desiredStatus: ['QUEUED', 'RUNNING', 'SUCCESS', 'FAILURE'],
-                jobName,
-                jwt: this.jwt
-            })
-            .then(build => {
+        const config = {
+            instance: this.instance,
+            pipelineId: this.pipelineId,
+            desiredStatus: ['QUEUED', 'RUNNING', 'SUCCESS', 'FAILURE'],
+            jobName,
+            jwt: this.jwt
+        };
+
+        if (this.sha) {
+            config.desiredSha = this.sha;
+        }
+
+        const sleepTime = jobName.endsWith('teardown') ? 1000 : 0;
+
+        return new Promise(resolve => {
+            setTimeout(resolve, sleepTime);
+        }).then(() => {
+            return sdapi.searchForBuild(config).then(build => {
                 this.eventId = build.eventId;
                 const job = this.jobs.find(j => j.name === jobName);
 
@@ -177,6 +185,7 @@ Then(
 
                 this.buildId = build.id;
             });
+        });
     }
 );
 
@@ -332,11 +341,14 @@ Then(
                 const joinJob = this.jobs.find(j => j.name === joinJobName);
                 const joinBuild = this.builds.find(b => b.jobId === joinJob.id);
 
+                // parentBuildId is array or integer
+                const parentBuildId = [joinBuild.parentBuildId].flat();
+
                 [parentJobName1, parentJobName2].forEach(jobName => {
                     const parentJob = this.jobs.find(j => j.name === jobName);
                     const parentBuild = this.builds.find(b => b.jobId === parentJob.id);
 
-                    Assert.oneOf(parentBuild.id, joinBuild.parentBuildId);
+                    Assert.oneOf(parentBuild.id, parentBuildId);
                 });
             });
     }
@@ -494,7 +506,12 @@ After(
     },
     function hook() {
         if (this.pipelineId) {
-            return this.deletePipeline(this.pipelineId);
+            return this.deletePipeline(this.pipelineId).catch(err => {
+                // Pipeline already deleted
+                if (err.statusCode !== 404) {
+                    throw err;
+                }
+            });
         }
 
         return false;

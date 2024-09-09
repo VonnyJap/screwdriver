@@ -13,7 +13,7 @@ const testBuildWithSteps = require('./data/buildWithSteps.json');
 const testBuildsStatuses = require('./data/buildsStatuses.json');
 const testSecrets = require('./data/secrets.json');
 const testWorkflowGraphWithStages = require('./data/workflowGraphWithStages.json');
-const rewireBuildsIndex = rewire('../../plugins/builds/index.js');
+const rewireBuildsIndex = rewire('../../plugins/builds/triggers/helpers.js');
 /* eslint-disable no-underscore-dangle */
 
 sinon.assert.expose(assert, { prefix: '' });
@@ -124,11 +124,17 @@ describe('build plugin test', () => {
     let generateTokenMock;
     let generateProfileMock;
     let bannerFactoryMock;
+    let loggerMock;
     let plugin;
     let server;
     const logBaseUrl = 'https://store.screwdriver.cd';
 
     beforeEach(async () => {
+        loggerMock = {
+            info: sinon.stub(),
+            error: sinon.stub(),
+            warn: sinon.stub()
+        };
         buildFactoryMock = {
             get: sinon.stub(),
             create: sinon.stub(),
@@ -195,6 +201,7 @@ describe('build plugin test', () => {
 
         /* eslint-disable prettier/prettier */
         plugin = rewiremock.proxy('../../plugins/builds', {
+            'screwdriver-logger': loggerMock,
             'jsonwebtoken': jwtMock,
             'badge-maker': badgeMock,
             '../../plugins/lock': lockMock
@@ -276,6 +283,7 @@ describe('build plugin test', () => {
 
     afterEach(() => {
         server = null;
+        sinon.restore();
     });
 
     it('registers the plugin', () => {
@@ -447,7 +455,8 @@ describe('build plugin test', () => {
                 pr: {},
                 getBuilds: sinon.stub(),
                 update: sinon.stub(),
-                toJson: sinon.stub().returns({ id: 123 })
+                toJson: sinon.stub().returns({ id: 123 }),
+                startFrom: '~commit'
             };
             eventFactoryMock.get.resolves(eventMock);
             eventMock.update.resolves(eventMock);
@@ -810,14 +819,24 @@ describe('build plugin test', () => {
 
             let userMock;
             let stageMock;
+            let stageAlphaMock;
+            let stageGammaMock;
 
             beforeEach(() => {
-                stageMock = {
+                stageAlphaMock = {
                     id: 1,
                     name: 'alpha',
                     jobIds: [22, 33, 44],
                     setup: 11,
                     teardown: 55
+                };
+                stageMock = stageAlphaMock;
+                stageGammaMock = {
+                    id: 3,
+                    name: 'gamma',
+                    jobIds: [772, 773, 774, 775],
+                    setup: 771,
+                    teardown: 776
                 };
                 jobMock = {
                     id: jobId,
@@ -828,7 +847,8 @@ describe('build plugin test', () => {
                             settings: {}
                         }
                     ],
-                    pipeline: sinon.stub().resolves(pipelineMock)()
+                    pipeline: sinon.stub().resolves(pipelineMock)(),
+                    getLatestBuild: sinon.stub().resolves(buildMock)
                 };
                 userMock = {
                     username: 'foo',
@@ -1518,6 +1538,7 @@ describe('build plugin test', () => {
                     };
 
                     jobMock.name = 'PR-15:main';
+                    jobFactoryMock.get.withArgs(publishJobMock.id).resolves(publishJobMock);
                     jobFactoryMock.get.withArgs({ pipelineId, name: 'PR-15:publish' }).resolves(publishJobMock);
                     jobFactoryMock.get.withArgs({ pipelineId, name: 'publish' }).resolves({ state: 'ENABLED' });
 
@@ -1615,6 +1636,156 @@ describe('build plugin test', () => {
                     return server.inject(options).then(reply => {
                         assert.equal(reply.statusCode, 200);
                         assert.notCalled(buildFactoryMock.create);
+                    });
+                });
+
+                it('triggers the startFrom job after the stage setup job if the startFrom job is a non-setup job in the same stage', () => {
+                    const status = 'SUCCESS';
+                    const options = {
+                        method: 'PUT',
+                        url: `/builds/${id}`,
+                        auth: {
+                            credentials: {
+                                username: id,
+                                scope: ['build']
+                            },
+                            strategy: ['token']
+                        },
+                        payload: {
+                            status
+                        }
+                    };
+
+                    jobMock = {
+                        id: 1234,
+                        name: 'stage@alpha:setup',
+                        pipelineId,
+                        permutations: [
+                            {
+                                settings: {
+                                    email: 'foo@bar.com'
+                                }
+                            }
+                        ],
+                        pipeline: sinon.stub().resolves(pipelineMock)(),
+                        getLatestBuild: sinon.stub().resolves(buildMock)
+                    };
+                    buildMock.job = sinon.stub().resolves(jobMock)();
+                    buildMock.parentBuilds = {
+                        123: { eventId: '8888', jobs: { '~commit': 7777, C: 7778, D: 7779 } }
+                    };
+                    eventMock.getBuilds.resolves([
+                        {
+                            id: 1,
+                            eventId: '8888',
+                            jobId: 1,
+                            status: 'FAILURE'
+                        },
+                        {
+                            id: 7777,
+                            eventId: '8888',
+                            jobId: 4,
+                            status: 'SUCCESS'
+                        },
+                        {
+                            id: 7778,
+                            eventId: '8888',
+                            jobId: 5,
+                            status: 'SUCCESS'
+                        },
+                        {
+                            id: 7779,
+                            eventId: '8888',
+                            jobId: 6,
+                            status: 'SUCCESS'
+                        }
+                    ]);
+
+                    eventMock.workflowGraph = testWorkflowGraphWithStages;
+                    eventMock.startFrom = 'alpha-certify';
+                    eventFactoryMock.get.resolves(eventMock);
+
+                    return server.inject(options).then(reply => {
+                        assert.equal(reply.statusCode, 200);
+                        assert.calledWith(jobFactoryMock.get, {
+                            name: eventMock.startFrom,
+                            pipelineId
+                        });
+                    });
+                });
+
+                it('triggers the startFrom job after the stage setup job if the startFrom job is a non-setup job in a different stage', () => {
+                    const status = 'SUCCESS';
+                    const options = {
+                        method: 'PUT',
+                        url: `/builds/${id}`,
+                        auth: {
+                            credentials: {
+                                username: id,
+                                scope: ['build']
+                            },
+                            strategy: ['token']
+                        },
+                        payload: {
+                            status
+                        }
+                    };
+
+                    jobMock = {
+                        id: 1234,
+                        name: 'stage@alpha:setup',
+                        pipelineId,
+                        permutations: [
+                            {
+                                settings: {
+                                    email: 'foo@bar.com'
+                                }
+                            }
+                        ],
+                        pipeline: sinon.stub().resolves(pipelineMock)(),
+                        getLatestBuild: sinon.stub().resolves(buildMock)
+                    };
+                    buildMock.job = sinon.stub().resolves(jobMock)();
+                    buildMock.parentBuilds = {
+                        123: { eventId: '8888', jobs: { '~commit': 7777, C: 7778, D: 7779 } }
+                    };
+                    eventMock.getBuilds.resolves([
+                        {
+                            id: 1,
+                            eventId: '8888',
+                            jobId: 1,
+                            status: 'FAILURE'
+                        },
+                        {
+                            id: 7777,
+                            eventId: '8888',
+                            jobId: 4,
+                            status: 'SUCCESS'
+                        },
+                        {
+                            id: 7778,
+                            eventId: '8888',
+                            jobId: 5,
+                            status: 'SUCCESS'
+                        },
+                        {
+                            id: 7779,
+                            eventId: '8888',
+                            jobId: 6,
+                            status: 'SUCCESS'
+                        }
+                    ]);
+
+                    eventMock.workflowGraph = testWorkflowGraphWithStages;
+                    eventMock.startFrom = 'beta-certify';
+                    eventFactoryMock.get.resolves(eventMock);
+
+                    return server.inject(options).then(reply => {
+                        assert.equal(reply.statusCode, 200);
+                        assert.calledWith(jobFactoryMock.get, {
+                            name: 'alpha-deploy',
+                            pipelineId
+                        });
                     });
                 });
 
@@ -1910,7 +2081,7 @@ describe('build plugin test', () => {
                         assert.notCalled(buildFactoryMock.create);
                         assert.notCalled(stageBuildFactoryMock.create);
                         assert.calledOnce(stageTeardownBuildMock.start);
-                        assert.calledOnce(stageTeardownBuildMock.update);
+                        assert.calledTwice(stageTeardownBuildMock.update);
                     });
                 });
 
@@ -1941,6 +2112,7 @@ describe('build plugin test', () => {
                     };
 
                     jobMock.name = 'PR-15:main';
+                    jobFactoryMock.get.withArgs(publishJobMock.id).resolves(publishJobMock);
                     jobFactoryMock.get.withArgs({ pipelineId, name: 'PR-15:publish' }).resolves(publishJobMock);
                     jobFactoryMock.get.withArgs({ pipelineId, name: 'publish' }).resolves(null);
 
@@ -2034,6 +2206,7 @@ describe('build plugin test', () => {
 
                     publishJobMock.state = 'DISABLED';
 
+                    jobFactoryMock.get.withArgs(publishJobMock.id).resolves(publishJobMock);
                     jobFactoryMock.get.withArgs({ pipelineId, name: 'publish' }).resolves(publishJobMock);
 
                     return server.inject(options).then(reply => {
@@ -2069,6 +2242,7 @@ describe('build plugin test', () => {
                     };
 
                     jobMock.name = 'PR-15:main';
+                    jobFactoryMock.get.withArgs(publishJobMock.id).resolves(publishJobMock);
                     jobFactoryMock.get.withArgs({ pipelineId, name: 'PR-15:publish' }).resolves(publishJobMock);
                     jobFactoryMock.get.withArgs({ pipelineId, name: 'publish' }).resolves({ state: 'DISABLED' });
 
@@ -2078,6 +2252,48 @@ describe('build plugin test', () => {
                     return server.inject(options).then(reply => {
                         assert.equal(reply.statusCode, 200);
                         assert.notCalled(buildFactoryMock.create);
+                    });
+                });
+
+                it('triggers a PR job with archived and disabled original job', () => {
+                    const username = id;
+                    const status = 'SUCCESS';
+                    const options = {
+                        method: 'PUT',
+                        url: `/builds/${id}`,
+                        auth: {
+                            credentials: {
+                                username,
+                                scmContext,
+                                scope: ['build']
+                            },
+                            strategy: ['token']
+                        },
+                        payload: {
+                            status
+                        }
+                    };
+
+                    eventMock.pr = {
+                        ref: 'pull/15/merge',
+                        prSource: 'branch',
+                        prBranchName: 'prBranchName',
+                        url: 'https://github.com/screwdriver-cd/ui/pull/292'
+                    };
+
+                    jobMock.name = 'PR-15:main';
+                    jobFactoryMock.get.withArgs(publishJobMock.id).resolves(publishJobMock);
+                    jobFactoryMock.get.withArgs({ pipelineId, name: 'PR-15:publish' }).resolves(publishJobMock);
+                    jobFactoryMock.get
+                        .withArgs({ pipelineId, name: 'publish' })
+                        .resolves({ state: 'DISABLED', archived: true });
+
+                    // flag should be true in chainPR events
+                    pipelineMock.chainPR = true;
+
+                    return server.inject(options).then(reply => {
+                        assert.equal(reply.statusCode, 200);
+                        assert.calledOnce(buildFactoryMock.create);
                     });
                 });
             });
@@ -2161,6 +2377,8 @@ describe('build plugin test', () => {
                     eventMock.baseBranch = 'master';
                     eventMock.sha = '58393af682d61de87789fb4961645c42180cec5a';
                     eventFactoryMock.get.withArgs({ id: 456 }).resolves(parentEventMock);
+                    jobFactoryMock.get.withArgs(jobB.id).resolves(jobB);
+                    jobFactoryMock.get.withArgs(jobC.id).resolves(jobC);
                     jobFactoryMock.get.withArgs({ pipelineId, name: 'b' }).resolves(jobB);
                     jobFactoryMock.get.withArgs({ pipelineId, name: 'c' }).resolves(jobC);
                     jobMock.name = 'a';
@@ -2653,6 +2871,8 @@ describe('build plugin test', () => {
                     );
                     eventFactoryMock.get.withArgs({ id: 456 }).resolves(parentEventMock);
                     eventFactoryMock.get.withArgs(8888).resolves(parentEventMock);
+                    jobFactoryMock.get.withArgs(jobB.id).resolves(jobB);
+                    jobFactoryMock.get.withArgs(jobC.id).resolves(jobC);
                     jobFactoryMock.get.withArgs(6).resolves(jobC);
                     jobFactoryMock.get.withArgs(3).resolves(jobC);
                     jobFactoryMock.get.withArgs({ pipelineId, name: 'b' }).resolves(jobB);
@@ -2728,6 +2948,7 @@ describe('build plugin test', () => {
                 });
 
                 afterEach(() => {
+                    sinon.restore();
                     newServer = null;
                 });
 
@@ -2757,6 +2978,7 @@ describe('build plugin test', () => {
                     const expectedEventArgs = {
                         pipelineId: '123',
                         startFrom: '~sd@123:a',
+                        skipMessage: 'Skip bulk external builds creation',
                         type: 'pipeline',
                         causeMessage: 'Triggered by sd@123:a',
                         parentBuildId: 12345,
@@ -2790,8 +3012,12 @@ describe('build plugin test', () => {
                         ]
                     };
 
+                    const externalEventMock = { ...eventMock };
+
+                    eventFactoryMock.create.resolves(externalEventMock);
+
                     return newServer.inject(options).then(() => {
-                        assert.notCalled(buildFactoryMock.create);
+                        assert.calledOnce(buildFactoryMock.create);
                         assert.calledOnce(eventFactoryMock.create);
                         assert.calledWith(eventFactoryMock.create.firstCall, expectedEventArgs);
                     });
@@ -2801,6 +3027,7 @@ describe('build plugin test', () => {
                     const expectedEventArgs = {
                         pipelineId: '2',
                         startFrom: '~sd@123:a',
+                        skipMessage: 'Skip bulk external builds creation',
                         type: 'pipeline',
                         causeMessage: 'Triggered by sd@123:a',
                         parentBuildId: 12345,
@@ -2815,38 +3042,59 @@ describe('build plugin test', () => {
                         username: 'foo',
                         sha: 'sha'
                     };
+                    const expectedBuildArgs = {
+                        jobId: 2,
+                        parentBuildId: 12345,
+                        parentBuilds: {
+                            123: {
+                                eventId: '8888',
+                                jobs: {
+                                    a: 12345
+                                }
+                            }
+                        },
+                        eventId: 2,
+                        username: 12345,
+                        scmContext: 'github:github.com',
+                        prRef: '',
+                        prSource: '',
+                        prInfo: '',
+                        start: true,
+                        baseBranch: null,
+                        sha: 'sha',
+                        configPipelineSha: 'sha'
+                    };
+
                     const externalEventMock = {
                         id: 2,
                         builds: externalEventBuilds,
+                        workflowGraph: {
+                            nodes: [{ name: '~pr' }, { name: '~commit' }, { name: 'a', id: 2 }],
+                            edges: [{ src: '~sd@123:a', dest: 'a' }]
+                        },
+                        sha: 'sha',
+                        configPipelineSha: 'sha',
                         getBuilds: sinon.stub().resolves(externalEventBuilds)
                     };
 
                     eventFactoryMock.create.resolves(externalEventMock);
-                    buildFactoryMock.get.withArgs(555).resolves({ id: 1234, status: 'SUCCESS' });
+                    eventFactoryMock.list.resolves([]);
+                    buildFactoryMock.get.withArgs({ eventId: 2, jobId: 2 }).resolves(null);
+                    buildFactoryMock.create.withArgs(expectedBuildArgs).returns({ id: 5 });
                     eventMock.workflowGraph = {
-                        nodes: [
-                            { name: '~pr' },
-                            { name: '~commit' },
-                            { name: 'a', id: 1 },
-                            { name: 'b', id: 2 },
-                            { name: 'c', id: 3 },
-                            { name: 'sd@2:a', id: 4 }
-                        ],
+                        nodes: [{ name: '~pr' }, { name: '~commit' }, { name: 'a', id: 1 }, { name: 'sd@2:a', id: 2 }],
                         edges: [
                             { src: '~pr', dest: 'a' },
                             { src: '~commit', dest: 'a' },
-                            { src: 'a', dest: 'b' },
-                            { src: 'b', dest: 'c', join: true },
-                            { src: 'a', dest: 'sd@2:a' },
-                            { src: 'sd@2:a', dest: 'c', join: true }
+                            { src: 'a', dest: 'sd@2:a' }
                         ]
                     };
 
                     return newServer.inject(options).then(() => {
-                        assert.calledWith(buildFactoryMock.create.firstCall, jobBconfig);
-                        assert.calledOnce(buildFactoryMock.create);
                         assert.calledOnce(eventFactoryMock.create);
                         assert.calledWith(eventFactoryMock.create.firstCall, expectedEventArgs);
+                        assert.calledOnce(buildFactoryMock.create);
+                        assert.calledWith(buildFactoryMock.create, expectedBuildArgs);
                     });
                 });
 
@@ -2855,6 +3103,7 @@ describe('build plugin test', () => {
                         pipelineId: '2',
                         configPipelineSha: 'sha',
                         startFrom: '~sd@123:a',
+                        skipMessage: 'Skip bulk external builds creation',
                         type: 'pipeline',
                         causeMessage: 'Triggered by sd@123:a',
                         parentBuildId: 12345,
@@ -2872,6 +3121,12 @@ describe('build plugin test', () => {
                     const externalEventMock = {
                         id: 2,
                         builds: externalEventBuilds,
+                        workflowGraph: {
+                            nodes: [{ name: '~pr' }, { name: '~commit' }, { name: 'a', id: 2 }],
+                            edges: [{ src: '~sd@123:a', dest: 'a' }]
+                        },
+                        sha: 'sha',
+                        configPipelineSha: 'sha',
                         getBuilds: sinon.stub().resolves(externalEventBuilds)
                     };
 
@@ -2928,6 +3183,7 @@ describe('build plugin test', () => {
                         })
                     );
                     eventFactoryMock.create.resolves(externalEventMock);
+                    eventFactoryMock.list.resolves([]);
                     buildFactoryMock.get.withArgs(555).resolves({ id: 1234, status: 'SUCCESS' });
                     eventMock.workflowGraph = {
                         nodes: [
@@ -2949,9 +3205,105 @@ describe('build plugin test', () => {
                     };
 
                     return newServer.inject(options).then(() => {
-                        assert.calledWith(buildFactoryMock.create.firstCall, jobBconfig);
                         assert.calledOnce(buildFactoryMock.create);
                         assert.calledWith(eventFactoryMock.create.firstCall, expectedEventArgs);
+                        assert.calledWith(buildFactoryMock.create.firstCall, jobBconfig);
+                    });
+                });
+
+                it('triggers other jobs even if one of the next external job is already deleted', () => {
+                    const expectedEventArgs1 = {
+                        pipelineId: '2',
+                        startFrom: '~sd@123:a',
+                        skipMessage: 'Skip bulk external builds creation',
+                        type: 'pipeline',
+                        causeMessage: 'Triggered by sd@123:a',
+                        parentBuildId: 12345,
+                        parentEventId: '8888',
+                        parentBuilds: {
+                            123: {
+                                eventId: '8888',
+                                jobs: { a: 12345 }
+                            }
+                        },
+                        scmContext: 'github:github.com',
+                        username: 'foo',
+                        sha: 'sha'
+                    };
+
+                    const expectedEventArgs2 = {
+                        ...expectedEventArgs1,
+                        pipelineId: '3'
+                    };
+
+                    const externalEventMock2 = {
+                        id: 3,
+                        builds: externalEventBuilds,
+                        workflowGraph: {
+                            nodes: [{ name: '~pr' }, { name: '~commit' }, { name: 'a', id: 2 }],
+                            edges: [{ src: '~sd@123:a', dest: 'a' }]
+                        },
+                        sha: 'sha',
+                        configPipelineSha: 'sha',
+                        getBuilds: sinon.stub().resolves(externalEventBuilds)
+                    };
+
+                    const externalEventConfig1 = {
+                        pipelineId: '2',
+                        startFrom: '~sd@123:a',
+                        skipMessage: 'Skip bulk external builds creation',
+                        type: 'pipeline',
+                        causeMessage: 'Triggered by sd@123:a',
+                        parentBuildId: 12345,
+                        scmContext: 'github:github.com',
+                        username: 'foo',
+                        sha: 'sha',
+                        parentEventId: '8888',
+                        parentBuilds: { 123: { eventId: '8888', jobs: { a: 12345 } } }
+                    };
+
+                    const externalEventConfig2 = {
+                        pipelineId: '3',
+                        startFrom: '~sd@123:a',
+                        skipMessage: 'Skip bulk external builds creation',
+                        type: 'pipeline',
+                        causeMessage: 'Triggered by sd@123:a',
+                        parentBuildId: 12345,
+                        scmContext: 'github:github.com',
+                        username: 'foo',
+                        sha: 'sha',
+                        parentEventId: '8888',
+                        parentBuilds: { 123: { eventId: '8888', jobs: { a: 12345 } } }
+                    };
+
+                    eventFactoryMock.create.withArgs(externalEventConfig1).rejects();
+                    eventFactoryMock.create.withArgs(externalEventConfig2).resolves(externalEventMock2);
+                    eventFactoryMock.list.resolves([]);
+                    eventMock.workflowGraph = {
+                        nodes: [
+                            { name: '~pr' },
+                            { name: '~commit' },
+                            { name: 'a', id: 1 },
+                            { name: 'c', id: 3 },
+                            { name: 'sd@2:a', id: 4 },
+                            { name: 'sd@3:a', id: 5 }
+                        ],
+                        edges: [
+                            { src: '~pr', dest: 'a' },
+                            { src: '~commit', dest: 'a' },
+                            { src: 'a', dest: 'sd@2:a' },
+                            { src: 'a', dest: 'sd@3:a' },
+                            { src: 'sd@3:a', dest: 'c', join: true }
+                        ]
+                    };
+
+                    return newServer.inject(options).then(() => {
+                        assert.calledWith(eventFactoryMock.create.firstCall, expectedEventArgs1);
+                        assert.calledWith(eventFactoryMock.create.secondCall, expectedEventArgs2);
+                        sinon.assert.calledOnceWithMatch(
+                            loggerMock.error,
+                            'Error in createExternalEvent:2 from pipeline:123-a-event:8888'
+                        );
                     });
                 });
 
@@ -3191,6 +3543,7 @@ describe('build plugin test', () => {
                     const buildC = {
                         jobId: 3,
                         id: 3,
+                        eventId: '8889',
                         status: 'CREATED',
                         parentBuilds: {
                             2: {
@@ -3457,7 +3810,7 @@ describe('build plugin test', () => {
                         configPipelineSha: 'abc123',
                         eventId: 8887,
                         jobId: 3,
-                        parentBuildId: [12345],
+                        parentBuildId: 12345,
                         parentBuilds: {
                             123: { eventId: '8888', jobs: { a: 12345 } },
                             2: { eventId: '8887', jobs: { a: 12345, b: null } }
@@ -3467,7 +3820,7 @@ describe('build plugin test', () => {
                         prInfo: '',
                         scmContext: 'github:github.com',
                         sha: '58393af682d61de87789fb4961645c42180cec5a',
-                        start: false,
+                        start: true,
                         username: 12345
                     };
 
@@ -3506,7 +3859,7 @@ describe('build plugin test', () => {
                                 { src: '~pr', dest: 'a' },
                                 { src: '~commit', dest: 'a' },
                                 { src: 'a', dest: '~sd@123:c' },
-                                { src: '~sd@123:c', dest: 'c' },
+                                { src: '~sd@123:a', dest: 'c' },
                                 { src: 'b', dest: 'c', join: true }
                             ]
                         }
@@ -3522,6 +3875,7 @@ describe('build plugin test', () => {
                     eventFactoryMock.get.withArgs(8889).resolves({ ...externalEventMock, id: '8889' });
                     eventFactoryMock.list.resolves([{ ...externalEventMock, id: '8889' }]);
                     buildFactoryMock.create.onCall(0).resolves(buildC);
+                    buildFactoryMock.get.withArgs({ eventId: externalEventMock.id, jobId: 6 }).resolves(null);
                     buildFactoryMock.get.withArgs(5555).resolves({ status: 'SUCCESS' }); // d is done
 
                     return newServer.inject(options).then(() => {
@@ -3529,8 +3883,6 @@ describe('build plugin test', () => {
                         assert.calledOnce(buildFactoryMock.getLatestBuilds);
                         assert.calledOnce(buildFactoryMock.create);
                         assert.calledWith(buildFactoryMock.create, jobCConfig);
-                        assert.calledOnce(buildC.update);
-                        assert.calledOnce(updatedBuildC.start);
                     });
                 });
 
@@ -3611,7 +3963,7 @@ describe('build plugin test', () => {
                         }
                     };
 
-                    eventFactoryMock.get.withArgs('8887').resolves(externalEventMock);
+                    eventFactoryMock.get.withArgs('8889').resolves(externalEventMock);
                     eventFactoryMock.list.resolves([{ ...externalEventMock, id: '8889' }]);
                     buildFactoryMock.create.onCall(0).returns({ ...buildMock, status: 'CREATED' });
                     buildFactoryMock.create.onCall(1).returns({ ...buildMock, status: 'CREATED' });
@@ -3693,11 +4045,13 @@ describe('build plugin test', () => {
                         scmContext: 'github:github.com',
                         sha: 'sha',
                         startFrom: '~sd@123:a',
+                        skipMessage: 'Skip bulk external builds creation',
                         type: 'pipeline',
                         username: 'foo'
                     };
 
                     eventFactoryMock.get.withArgs('8887').resolves(externalEventMock);
+                    eventFactoryMock.create.withArgs(eventConfig).resolves(externalEventMock);
                     eventFactoryMock.list.resolves([{ ...externalEventMock, id: '8889' }]);
                     buildFactoryMock.get.withArgs(5555).resolves({ status: 'SUCCESS' }); // d is done
 
@@ -4394,6 +4748,7 @@ describe('build plugin test', () => {
                         scmContext: 'github:github.com',
                         sha: 'sha',
                         startFrom: '~sd@123:a',
+                        skipMessage: 'Skip bulk external builds creation',
                         type: 'pipeline',
                         username: 'foo'
                     };
@@ -4784,31 +5139,44 @@ describe('build plugin test', () => {
 
                 it('create stage teardown and update stageBuild status if parent has some failures', () => {
                     const localOptions = hoek.clone(options);
+
+                    localOptions.payload.status = 'FAILURE';
+
+                    // event
+                    eventMock.workflowGraph = testWorkflowGraphWithStages;
+                    eventFactoryMock.get.resolves(eventMock);
+
+                    // stage
+                    stageFactoryMock.get.resolves(stageAlphaMock);
+
+                    // stage build
                     const stageBuildMock = {
                         id: 1,
                         stageId: 1,
                         update: sinon.stub().resolves(),
-                        status: 'SUCCESS'
+                        status: 'RUNNING'
                     };
 
-                    localOptions.payload.status = 'FAILURE';
-                    eventMock.workflowGraph = testWorkflowGraphWithStages;
-                    eventFactoryMock.get.resolves(eventMock);
+                    stageBuildFactoryMock.get.resolves(stageBuildMock);
 
-                    const buildC = {
-                        jobId: 3,
+                    // Current build and job
+                    const buildAlphaTest = getBuildMock({
+                        jobId: 33,
                         eventId: '8888',
-                        id: 3,
-                        status: 'CREATED',
-                        start: sinon.stub().resolves(null)
-                    };
-                    const updatedBuildC = Object.assign(buildC, {
-                        parentBuilds: { 123: { eventId: '8888', jobs: { d: 5555, a: 12345 } } }
+                        id: 12345,
+                        status: 'RUNNING',
+                        start: sinon.stub().resolves(null),
+                        parentBuilds: {
+                            123: { eventId: '8888', jobs: { 'stage@alpha:setup': 1001, 'alpha-deploy': 1002 } }
+                        }
                     });
 
-                    jobMock = {
-                        id: 1234,
-                        name: 'stage@alpha:teardown',
+                    buildAlphaTest.update.resolves(buildAlphaTest);
+                    buildFactoryMock.get.withArgs(12345).resolves(buildAlphaTest);
+
+                    const jobMockAlphaTest = {
+                        id: 33,
+                        name: 'alpha-test',
                         pipelineId,
                         permutations: [
                             {
@@ -4819,69 +5187,142 @@ describe('build plugin test', () => {
                         ],
                         state: 'ENABLED',
                         pipeline: sinon.stub().resolves(pipelineMock)(),
-                        getLatestBuild: sinon.stub().resolves(buildMock)
+                        getLatestBuild: sinon.stub().resolves(buildAlphaTest)
                     };
-                    buildMock = getBuildMock(testBuild);
-                    buildMock.job = sinon.stub().resolves(jobMock)();
-                    buildMock.update.resolves(buildMock);
-                    buildFactoryMock.get.resolves(buildMock);
-                    buildC.update = sinon.stub().resolves(updatedBuildC);
-                    buildFactoryMock.getLatestBuilds.resolves([
+
+                    buildAlphaTest.job = sinon.stub().resolves(jobMockAlphaTest)();
+
+                    // Teardown job and build
+                    const jobMockAlphaTeardown = {
+                        id: 55,
+                        name: 'stage@alpha:teardown',
+                        pipelineId,
+                        permutations: [
+                            {
+                                settings: {
+                                    email: 'foo@bar.com'
+                                }
+                            }
+                        ],
+                        state: 'ENABLED'
+                    };
+
+                    jobFactoryMock.get
+                        .withArgs({ pipelineId: pipelineMock.id, name: jobMockAlphaTeardown.name })
+                        .resolves(jobMockAlphaTeardown);
+
+                    const buildAlphaTeardown = getBuildMock({
+                        jobId: 55,
+                        eventId: '8888',
+                        id: 1005,
+                        status: 'CREATED',
+                        parentBuilds: {
+                            123: {
+                                eventId: '8888',
+                                jobs: { 'stage@alpha:setup': 1001, 'alpha-deploy': 1002, 'alpha-test': 12345 }
+                            }
+                        },
+                        start: sinon.stub().resolves(null)
+                    });
+
+                    buildFactoryMock.get.withArgs({ jobId: 55, eventId: '8888' }).onCall(0).resolves(null);
+                    buildFactoryMock.create.onCall(0).resolves(buildAlphaTeardown);
+                    buildFactoryMock.get
+                        .withArgs({ jobId: 55, eventId: '8888' })
+                        .onCall(1)
+                        .resolves(buildAlphaTeardown);
+                    buildAlphaTeardown.update.resolves(buildAlphaTeardown);
+
+                    eventMock.getBuilds.resolves([
+                        // stage@alpha-setup
                         {
-                            jobId: 1,
-                            id: 12345,
+                            jobId: 11,
+                            id: 1001,
                             eventId: '8888',
                             status: 'SUCCESS'
                         },
+                        // alpha-deploy
                         {
-                            jobId: 4,
-                            id: 5555,
+                            jobId: 22,
+                            id: 1002,
                             eventId: '8888',
-                            status: 'FAILURE'
+                            status: 'SUCCESS'
                         },
-                        buildC
+                        buildAlphaTest
                     ]);
-                    stageFactoryMock.get.resolves(stageMock);
-                    stageBuildFactoryMock.get.resolves(stageBuildMock);
-                    buildFactoryMock.get.withArgs({ jobId: 3, eventId: '8888' }).resolves(buildC);
-                    buildFactoryMock.get.withArgs({ jobId: 1234, eventId: '8888' }).resolves(null);
-                    buildFactoryMock.create.onCall(0).resolves(buildC);
-                    jobFactoryMock.get.resolves(jobMock);
 
                     return newServer.inject(localOptions).then(() => {
-                        assert.calledOnce(buildFactoryMock.create);
                         assert.calledOnce(stageBuildMock.update);
+                        assert.equal(stageBuildMock.status, 'FAILURE');
+
+                        assert.calledOnce(buildFactoryMock.create);
+                        assert.calledWith(buildFactoryMock.create, {
+                            jobId: 55,
+                            sha: '58393af682d61de87789fb4961645c42180cec5a',
+                            parentBuildId: 12345,
+                            parentBuilds: {
+                                123: {
+                                    eventId: '8888',
+                                    jobs: { 'stage@alpha:setup': 1001, 'alpha-deploy': 1002, 'alpha-test': 12345 }
+                                }
+                            },
+                            eventId: '8888',
+                            username: 12345,
+                            configPipelineSha: 'abc123',
+                            scmContext: 'github:github.com',
+                            prRef: '',
+                            prSource: '',
+                            prInfo: '',
+                            start: false,
+                            baseBranch: 'master'
+                        });
+
+                        assert.calledOnce(buildAlphaTeardown.update);
+                        assert.equal(buildAlphaTeardown.status, 'QUEUED');
+                        assert.calledOnce(buildAlphaTeardown.start);
                     });
                 });
 
                 it('update/start stage teardown if it already exists and update stageBuild status if parent has some failures', () => {
                     const localOptions = hoek.clone(options);
-                    const stageBuildMock = {
-                        id: 1,
-                        stageId: 1,
-                        update: sinon.stub().resolves(),
-                        status: 'SUCCESS'
-                    };
 
                     localOptions.payload.status = 'FAILURE';
+
+                    // event
                     eventMock.workflowGraph = testWorkflowGraphWithStages;
-                    eventMock.getBuilds.resolves([{ status: 'FAILURE' }, { status: 'SUCCESS' }]);
                     eventFactoryMock.get.resolves(eventMock);
 
-                    const buildC = {
-                        jobId: 3,
-                        eventId: '8888',
+                    // stage
+                    stageFactoryMock.get.resolves(stageGammaMock);
+
+                    // stage build
+                    const stageBuildMock = {
                         id: 3,
-                        status: 'CREATED',
-                        start: sinon.stub().resolves(null)
+                        stageId: 3,
+                        update: sinon.stub().resolves(),
+                        status: 'FAILURE'
                     };
-                    const updatedBuildC = Object.assign(buildC, {
-                        parentBuilds: { 123: { eventId: '8888', jobs: { d: 5555, a: 12345 } } }
+
+                    stageBuildFactoryMock.get.resolves(stageBuildMock);
+
+                    // Current build and job
+                    const buildGammaTestFunctional = getBuildMock({
+                        jobId: 33,
+                        eventId: '8888',
+                        id: 12345,
+                        status: 'RUNNING',
+                        start: sinon.stub().resolves(null),
+                        parentBuilds: {
+                            123: { eventId: '8888', jobs: { 'stage@gamma:setup': 7001, 'gamma-deploy': 7002 } }
+                        }
                     });
 
-                    jobMock = {
-                        id: 1234,
-                        name: 'stage@alpha:teardown',
+                    buildGammaTestFunctional.update.resolves(buildGammaTestFunctional);
+                    buildFactoryMock.get.withArgs(12345).resolves(buildGammaTestFunctional);
+
+                    const jobMockGammaFunctionalTest = {
+                        id: 774,
+                        name: 'gamma-test-functional',
                         pipelineId,
                         permutations: [
                             {
@@ -4892,44 +5333,96 @@ describe('build plugin test', () => {
                         ],
                         state: 'ENABLED',
                         pipeline: sinon.stub().resolves(pipelineMock)(),
-                        getLatestBuild: sinon.stub().resolves(buildMock)
+                        getLatestBuild: sinon.stub().resolves(buildGammaTestFunctional)
                     };
-                    buildMock = getBuildMock(testBuild);
-                    buildMock.job = sinon.stub().resolves(jobMock)();
-                    buildMock.update.resolves(buildMock);
-                    buildFactoryMock.get.withArgs(12345).resolves(buildMock);
-                    buildC.update = sinon.stub().resolves(updatedBuildC);
-                    buildFactoryMock.getLatestBuilds.resolves([
+
+                    buildGammaTestFunctional.job = sinon.stub().resolves(jobMockGammaFunctionalTest)();
+
+                    // Teardown job and build
+                    const jobMockGammaTeardown = {
+                        id: 776,
+                        name: 'stage@gamma:teardown',
+                        pipelineId,
+                        permutations: [
+                            {
+                                settings: {
+                                    email: 'foo@bar.com'
+                                }
+                            }
+                        ],
+                        state: 'ENABLED'
+                    };
+
+                    jobFactoryMock.get
+                        .withArgs({ pipelineId: pipelineMock.id, name: jobMockGammaTeardown.name })
+                        .resolves(jobMockGammaTeardown);
+
+                    const buildGammaTeardown = getBuildMock({
+                        jobId: 776,
+                        eventId: '8888',
+                        id: 7004,
+                        status: 'CREATED',
+                        parentBuildId: 7003,
+                        parentBuilds: {
+                            123: {
+                                eventId: '8888',
+                                jobs: {
+                                    'stage@gamma:setup': 7001,
+                                    'gamma-deploy': 7002,
+                                    'gamma-test-integration': 7003
+                                }
+                            }
+                        },
+                        start: sinon.stub().resolves(null)
+                    });
+
+                    buildFactoryMock.get.withArgs({ jobId: 776, eventId: '8888' }).resolves(buildGammaTeardown);
+                    buildGammaTeardown.update.resolves(buildGammaTeardown);
+
+                    eventMock.getBuilds.resolves([
+                        // stage@gamma-setup
                         {
-                            jobId: 1,
-                            id: 12345,
+                            jobId: 771,
+                            id: 7001,
                             eventId: '8888',
                             status: 'SUCCESS'
                         },
+                        // gamma-deploy
                         {
-                            jobId: 4,
-                            id: 5555,
+                            jobId: 772,
+                            id: 7002,
+                            eventId: '8888',
+                            status: 'SUCCESS'
+                        },
+                        // gamma-test-integration
+                        {
+                            jobId: 773,
+                            id: 7003,
                             eventId: '8888',
                             status: 'FAILURE'
                         },
-                        buildC
+                        buildGammaTestFunctional
                     ]);
-                    const stageTeardownBuildMock = {
-                        status: 'CREATED',
-                        start: sinon.stub().resolves(null),
-                        update: sinon.stub().resolves(null)
-                    };
-
-                    stageFactoryMock.get.resolves(stageMock);
-                    stageBuildFactoryMock.get.resolves(stageBuildMock);
-                    buildFactoryMock.get.resolves(stageTeardownBuildMock);
-                    buildFactoryMock.list.resolves([buildMock]);
 
                     return newServer.inject(localOptions).then(() => {
+                        assert.notCalled(stageBuildMock.update);
+
                         assert.notCalled(buildFactoryMock.create);
-                        assert.calledOnce(stageBuildMock.update);
-                        assert.calledOnce(stageTeardownBuildMock.update);
-                        assert.calledOnce(stageTeardownBuildMock.start);
+                        assert.calledTwice(buildGammaTeardown.update);
+                        assert.deepEqual(buildGammaTeardown.parentBuildId, [12345, 7003]);
+                        assert.deepEqual(buildGammaTeardown.parentBuilds, {
+                            123: {
+                                eventId: '8888',
+                                jobs: {
+                                    'stage@gamma:setup': 7001,
+                                    'gamma-deploy': 7002,
+                                    'gamma-test-integration': 7003,
+                                    'gamma-test-functional': 12345
+                                }
+                            }
+                        });
+                        assert.equal(buildGammaTeardown.status, 'QUEUED');
+                        assert.calledOnce(buildGammaTeardown.start);
                     });
                 });
 
@@ -4986,9 +5479,14 @@ describe('build plugin test', () => {
                         eventFactoryMock.create.resolves({
                             id: 2,
                             builds: externalEventBuilds,
+                            workflowGraph: {
+                                nodes: [],
+                                edges: [{ src: '~sd@123:a', dest: 'a' }]
+                            },
                             getBuilds: sinon.stub().resolves(externalEventBuilds)
                         });
                         buildFactoryMock.get.withArgs(555).resolves({ id: 1234, status: 'SUCCESS' });
+                        eventFactoryMock.list.resolves([]);
                         eventMock.workflowGraph = {
                             nodes: [
                                 { name: '~pr' },
