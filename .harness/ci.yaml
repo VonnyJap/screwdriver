@@ -1,0 +1,37 @@
+pipeline:
+  name: Screwdriver
+  identifier: Screwdriver
+  projectIdentifier: VonnyTest
+  orgIdentifier: dpsdlc
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: VonnyJapscrewdriver
+        build: <+input>
+  stages:
+    - stage:
+        name: publish-npm
+        identifier: publishnpm
+        description: ""
+        type: CI
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: vonnyekscluster
+              namespace: hello
+              automountServiceAccountToken: true
+              nodeSelector: {}
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Run_1
+                  identifier: Run_1
+                  spec:
+                    connectorRef: org.dockerhub
+                    image: hello
+                    shell: Sh
